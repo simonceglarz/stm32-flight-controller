@@ -1,0 +1,24 @@
+# STM32CubeIDE build output
+firmware/**/Debug/
+firmware/**/Release/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+
+# Host test builds
+tests/build/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editors / OS
+.vscode/
+*.swp
+.DS_Store
