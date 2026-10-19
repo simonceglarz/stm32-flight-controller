@@ -24,7 +24,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "pid.h"
+#include "comp_filter.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -92,7 +93,10 @@ int main(void)
   MX_GPIO_Init();
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
-
+  static pid_ctrl_t     roll_pid;      /* placeholder: proves core/ links into the firmware */
+  static comp_filter_t  roll_filter;
+  pid_init(&roll_pid, 1.0f, 0.0f, 0.0f, -1.0f, 1.0f);
+  cf_init(&roll_filter, 0.47f);
   /* USER CODE END 2 */
 
   /* Init scheduler */
