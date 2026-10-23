@@ -20,10 +20,12 @@
 #include "main.h"
 #include "cmsis_os.h"
 #include "spi.h"
+#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 #include "pid.h"
 #include "comp_filter.h"
 /* USER CODE END Includes */
@@ -60,6 +62,13 @@ void MX_FREERTOS_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/* Redirect prinf to USART2 (the ST_LINK's serial port). */
+int _write(int file, char* ptr, int len)
+{
+	(void)file;		//unused: all output goes to the UART
+	HAL_UART_Transmit(&huart2, (uint8_t *)ptr, len, HAL_MAX_DELAY);	//send the bytes, wait until done
+	return len;		//tell printf everything was written
+}
 /* USER CODE END 0 */
 
 /**
@@ -92,6 +101,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_SPI2_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   static pid_ctrl_t     roll_pid;      /* placeholder: proves core/ links into the firmware */
   static comp_filter_t  roll_filter;
