@@ -26,6 +26,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include "lsm6dsox.h"
+#include "imu_convert.h"
+#include "comp_filter.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -126,15 +129,102 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
-	uint32_t count = 0;
 
-  /* Infinite loop */
-  for(;;)
-  {
-    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);	//flip the green LED (LD2 is on pin PA5
-    printf("alive %lu test float %.2f\r\n", count++, (double)3.14159f);		//\r\n - new line in the terminal
-    osDelay(500);							//sleep this task for 500ms
-  }
+	/*---One-time setup*/
+	int rc = lsm6dsox_init();		/*bring up the IMU; 0 = success*/
+	printf("IMU init: %d\r\n", rc);	/*report which step failed, if any*/
+
+	if(rc !=0)
+	{
+		/* Init failed: stop here and blink fast (10Hz) so failure is visible
+		 * even without a terminal open. The task never continues*/
+		for (;;)
+		{
+			HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+			osDelay(100);
+		}
+	}
+
+	  comp_filter_t roll;
+	  cf_init(&roll, 0.47f);                     /* tau = 0.47 s */
+
+	  /* 1. Let the gyro settle after power-on. Its first outputs are not
+	        valid, and calibrating on them gives a wrong bias. */
+	  osDelay(200);                              /* 200 ms, generous */
+	  for (int i = 0; i < 20; i++) {             /* throw away 20 samples (~200 ms) */
+	    uint8_t junk[12];
+	    osDelay(10);
+	    (void)lsm6dsox_read_raw(junk);           /* (void) = result deliberately ignored */
+	  }
+
+	  /* 2. Measure the bias: 100 samples, 10 ms apart = 1 s. Board must be still. */
+	  float gx_samples[100];
+	  float gmin = 1e9f, gmax = -1e9f;           /* smallest and largest sample seen */
+	  for (int i = 0; i < 100; i++) {
+	    uint8_t raw_cal[12];
+	    imu_sample_t cal;
+	    osDelay(10);
+	    if (lsm6dsox_read_raw(raw_cal) != 0) { i--; continue; }  /* retry a failed read */
+	    imu_convert(raw_cal, &cal);
+	    gx_samples[i] = cal.gyro_dps[0];
+	    if (gx_samples[i] < gmin) gmin = gx_samples[i];
+	    if (gx_samples[i] > gmax) gmax = gx_samples[i];
+	  }
+	  cf_calibrate_bias(&roll, gx_samples, 100);
+
+	  /* 3. Print what calibration saw, so a bad calibration is visible. */
+	  printf("gyro X bias: %.3f dps\r\n", (double)roll.gyro_bias_dps);
+	  printf("cal spread: %.2f to %.2f dps\r\n", (double)gmin, (double)gmax);
+	  printf("first/last cal sample: %.2f / %.2f dps\r\n",
+	         (double)gx_samples[0], (double)gx_samples[99]);
+
+	/*OSKernelGetTickCount() = FreeRTOS's millisecond counter since start-up
+	 'next' is the absolute time (in ticks) when the last loop should run. */
+	uint32_t next = osKernelGetTickCount();
+	uint32_t n = 0;			//loop counter, used to print less often
+
+	/*---100Hz Loop---*/
+	for(;;)
+	{
+		next +=10;		//schedule the next run 10ms later
+
+		/*Sleep until the absolute time 'next'. Unlike osDely(10), which waits 10ms
+		 * AFTER this loop;s work, this keeps a stead 10ms period no how long the
+		 * work took, so the loop rate doesn't drift */
+		osDelayUntil(next);
+
+		/*Read the 12 raw bytes. On a bus error, skip this sample and try next time. */
+		uint8_t raw[12];
+		if (lsm6dsox_read_raw(raw) != 0) {
+			printf("read error\r\n");
+			continue;
+		}
+
+		/* Convert raw counts to physical units (test on the PC; test_imu_convert. */
+		imu_sample_t s;
+		imu_convert(raw, &s);
+
+		/* Angle from gravity; how gravity splits between the Y and  axes as the board
+		 * rolls around its X axis. Noisy, but doesnt drift. */
+		float acc_angle = cf_accel_angle_deg(s.accel_g[1], s.accel_g[2]);
+
+		/* Fuse: integrate the X gyro (smooth,drifts) and pull gently toward
+		 * accel angle (noisy, no drift). dt = 0.01s because the loop runs every 10ms. */
+		float angle = cf_update(&roll, s.gyro_dps[0], acc_angle, 0.01f);
+
+		/* Print only every 10th loop (10Hz). At 115200 baud one line takes ~5ms
+		 * to send, so printing every loop would eat half of each 10ms period. */
+		if (++n % 10 ==0) {
+			HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);		/*slow blink = loop is alive */
+			printf("%lu,%.3f,%.2f,%.2f,%.2f\r\n",
+			       osKernelGetTickCount(),           /* time in ms since start-up            */
+			       (double)s.accel_g[2],             /* az, g                                */
+			       (double)s.gyro_dps[0],            /* gx, deg/s                            */
+			       (double)acc_angle,                /* accelerometer-only angle, deg        */
+			       (double)angle);                   /* filtered angle, deg                  */
+		}
+	}
+
   /* USER CODE END StartDefaultTask */
 }
 
