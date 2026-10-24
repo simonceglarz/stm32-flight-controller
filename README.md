@@ -54,6 +54,16 @@ LSM6DSOX --SPI2 (5.6 MHz, mode 3)--> STM32F446
 | Same disturbance, rate integrator ki = 0.1 | Peak 1.7°, recovered within ~0.3 s |
 | D-term low-pass filter (α = 0.95, ≈ 13 Hz cutoff) | Removed D-amplified gyro noise from motor command; settling +11 ms |
 
+| No integrator: stuck 4° off | Rate integrator ki = 0.1: disturbance rejected |
+|---|---|
+| ![No integrator](docs/captures/sil_disturbance_no_integrator.png) | ![Final gains](docs/captures/sil_final_disturbance_ki0.1.png) |
+
+| D term unfiltered: gyro noise in motor command | D-term filter α = 0.95 (≈13 Hz) |
+|---|---|
+| ![D unfiltered](docs/captures/sil_dterm_unfiltered.png) | ![D filtered](docs/captures/sil_dterm_filtered.png) |
+
+Inner loop gain too high (rate kp ×3): motor lag causes ringing → [plot](docs/captures/sil_inner_loop_too_stiff.png)
+
 ## Build and test
 
 ```bash
