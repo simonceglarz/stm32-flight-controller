@@ -27,4 +27,5 @@ int lsm6dsox_init(void);
  */
 int lsm6dsox_read_raw(uint8_t raw[12]);
 
+int8_t lsm6dsox_read_freq_fine(void);
 #endif /* LSM6DSOX_H */

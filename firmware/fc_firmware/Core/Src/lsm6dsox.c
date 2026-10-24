@@ -70,6 +70,8 @@ static int bus_read(uint8_t reg, uint8_t *buf, uint16_t len)
     return -1;
 }
 
+
+
 /* Write one byte `val` into register `reg`. */
 static int bus_write(uint8_t reg, uint8_t val)
 {
@@ -222,4 +224,12 @@ int lsm6dsox_read_raw(uint8_t raw[12])
        sensor steps through 0x22..0x2D by itself: gyro X,Y,Z then accel X,Y,Z.
        One transaction means all six values come from the same sample. */
     return bus_read(LSM6DSOX_OUTX_L_G, raw, LSM6DSOX_BURST_LEN);
+}
+
+/* Reads the chip's factory oscillator trim (0x63), signed. 0 if the read fails. */
+int8_t lsm6dsox_read_freq_fine(void)
+{
+    uint8_t v = 0;
+    if (bus_read(0x63, &v, 1) != 0) return 0;
+    return (int8_t)v;   /* reinterpret byte as two's complement */
 }

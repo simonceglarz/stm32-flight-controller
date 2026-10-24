@@ -29,16 +29,27 @@
 #include "lsm6dsox.h"
 #include "imu_convert.h"
 #include "comp_filter.h"
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+/* One telemetry sample, passed from the control task to the telemetry task */
+typedef struct {
+	uint32_t tick;	/*ms since boot */
+	float az_g;		/*accel Z, g */
+	float gx_dps;	/*raw gyro X, deg/s */
+	float acc_deg;	/*accel-only angle, deg */
+	float angle_deg;/*filtered angle, deg */
+} telem_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define IMU_FLAG		0x01u	/*thread flag set by the data-ready interrupt*/
+#define IMU_ODR_HZ		1608.0f	/*IMU output rate = loop rate (REQ-01) */
+#define TELEM_DIVIDER	166u	/*send 1 of every 166 samples -> 10Hz telemetry*/
+#define DRDY_TIMEOUT_MS	5u		/*no data-ready for 5ms = IMU fault (seed for REQ-02*/
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -48,7 +59,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-
+static osMessageQueueId_t telemQueue;	/*mailbox between control and telemetry tasks */
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
@@ -60,7 +71,7 @@ const osThreadAttr_t defaultTask_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
-
+static void TelemetryTask(void *argument);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -76,6 +87,7 @@ void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
    /* Run time stack overflow checking is performed if
    configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2. This hook function is
    called if a stack overflow is detected. */
+	(void)xTask; (void)pcTaskName;
 }
 /* USER CODE END 4 */
 
@@ -103,6 +115,9 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+	/*16 slots; if the telemetry task falls behind, new samples are dropped
+	instead of the control task waiting */
+	telemQueue = osMessageQueueNew(16, sizeof(telem_t), NULL);
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -111,6 +126,12 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+  const osThreadAttr_t telemAttr = {
+		  .name = "telem",
+		  .stack_size = 512*4,			/*bytes; prinf with floats needs more room */
+		  .priority = osPriorityLow,	/*below the control task; printing never delays control */
+  };
+  osThreadNew(TelemetryTask, NULL, &telemAttr);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -130,9 +151,16 @@ void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
 
+	(void)argument;
 	/*---One-time setup*/
 	int rc = lsm6dsox_init();		/*bring up the IMU; 0 = success*/
 	printf("IMU init: %d\r\n", rc);	/*report which step failed, if any*/
+	  /* Factory-trimmed oscillator deviation for this specific chip (DS12814, reg 0x63).
+	     Signed 8-bit: each count = [scale from datasheet] % of nominal ODR. */
+	  int8_t freq_fine = lsm6dsox_read_freq_fine();
+	  printf("INTERNAL_FREQ_FINE: %d (~%.2f%% vs nominal)\r\n",
+	         freq_fine, (double)(freq_fine * 0.15f));   /* 0.15 %/LSB, DS12814 Table 174 */
+
 
 	if(rc !=0)
 	{
@@ -178,58 +206,75 @@ void StartDefaultTask(void *argument)
 	  printf("first/last cal sample: %.2f / %.2f dps\r\n",
 	         (double)gx_samples[0], (double)gx_samples[99]);
 
-	/*OSKernelGetTickCount() = FreeRTOS's millisecond counter since start-up
-	 'next' is the absolute time (in ticks) when the last loop should run. */
-	uint32_t next = osKernelGetTickCount();
-	uint32_t n = 0;			//loop counter, used to print less often
+	/* Calibration reads ran while data-ready pulses were firing, so flags
+     are already set. Clear them so the first loop waits for a fresh sample. */
+	  osThreadFlagsClear(IMU_FLAG);
 
-	/*---100Hz Loop---*/
-	for(;;)
-	{
-		next +=10;		//schedule the next run 10ms later
+	  const float dt = 1.0f / IMU_ODR_HZ;   /* 0.6 ms nominal sample period */
+	  uint32_t n = 0;
+	  uint32_t drdy_timeouts = 0;
 
-		/*Sleep until the absolute time 'next'. Unlike osDely(10), which waits 10ms
-		 * AFTER this loop;s work, this keeps a stead 10ms period no how long the
-		 * work took, so the loop rate doesn't drift */
-		osDelayUntil(next);
-
-		/*Read the 12 raw bytes. On a bus error, skip this sample and try next time. */
-		uint8_t raw[12];
-		if (lsm6dsox_read_raw(raw) != 0) {
-			printf("read error\r\n");
-			continue;
+	  for (;;) {
+		/* Sleep until the interrupt says a new sample is ready. The task uses
+		   no CPU while waiting; the IMU's clock sets the loop rate. */
+		uint32_t f = osThreadFlagsWait(IMU_FLAG, osFlagsWaitAny, DRDY_TIMEOUT_MS);
+		if (f & osFlagsError) {             /* timed out: no sample in 5 ms */
+		  drdy_timeouts++;                  /* later: REQ-02 -> zero motors, FAULT state */
+		  continue;
 		}
 
-		/* Convert raw counts to physical units (test on the PC; test_imu_convert. */
-		imu_sample_t s;
-		imu_convert(raw, &s);
+    HAL_GPIO_WritePin(LOOP_PIN_GPIO_Port, LOOP_PIN_Pin, GPIO_PIN_SET);   /* loop start */
 
-		/* Angle from gravity; how gravity splits between the Y and  axes as the board
-		 * rolls around its X axis. Noisy, but doesnt drift. */
-		float acc_angle = cf_accel_angle_deg(s.accel_g[1], s.accel_g[2]);
+    uint8_t raw[12];
+    if (lsm6dsox_read_raw(raw) == 0) {
+      imu_sample_t s;
+      imu_convert(raw, &s);
+      float acc_angle = cf_accel_angle_deg(s.accel_g[1], s.accel_g[2]);
+      float angle = cf_update(&roll, s.gyro_dps[0], acc_angle, dt);
 
-		/* Fuse: integrate the X gyro (smooth,drifts) and pull gently toward
-		 * accel angle (noisy, no drift). dt = 0.01s because the loop runs every 10ms. */
-		float angle = cf_update(&roll, s.gyro_dps[0], acc_angle, 0.01f);
+      if (++n % TELEM_DIVIDER == 0) {
+        telem_t t = { osKernelGetTickCount(), s.accel_g[2], s.gyro_dps[0], acc_angle, angle };
+        osMessageQueuePut(telemQueue, &t, 0, 0);   /* timeout 0: never wait here */
+      }
+    }
 
-		/* Print only every 10th loop (10Hz). At 115200 baud one line takes ~5ms
-		 * to send, so printing every loop would eat half of each 10ms period. */
-		if (++n % 10 ==0) {
-			HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);		/*slow blink = loop is alive */
-			printf("%lu,%.3f,%.2f,%.2f,%.2f\r\n",
-			       osKernelGetTickCount(),           /* time in ms since start-up            */
-			       (double)s.accel_g[2],             /* az, g                                */
-			       (double)s.gyro_dps[0],            /* gx, deg/s                            */
-			       (double)acc_angle,                /* accelerometer-only angle, deg        */
-			       (double)angle);                   /* filtered angle, deg                  */
-		}
-	}
+    HAL_GPIO_WritePin(LOOP_PIN_GPIO_Port, LOOP_PIN_Pin, GPIO_PIN_RESET); /* loop end */
+  }
 
   /* USER CODE END StartDefaultTask */
 }
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+/* Low-priority task: the only place that prints. A ~40-character line takes
+   ~3.5 ms at 115200 baud; running here, it gets interrupted by the control
+   task instead of blocking it. */
+static void TelemetryTask(void *argument)
+{
+  (void)argument;
+  telem_t t;
+  for (;;) {
+    if (osMessageQueueGet(telemQueue, &t, NULL, osWaitForever) == osOK) {
+    	char line[64];                                    /* one CSV line, ~40 chars */
+    	int len = snprintf(line, sizeof line, "%lu,%.3f,%.2f,%.2f,%.2f\r\n",
+    	                   t.tick, (double)t.az_g, (double)t.gx_dps,
+    	                   (double)t.acc_deg, (double)t.angle_deg);
+    	if (len > 0) {
+    	  /* No newlib stdout lock held while sending, so the control task
+    	     can preempt this at any point. */
+    	  HAL_UART_Transmit(&huart2, (uint8_t *)line, (uint16_t)len, HAL_MAX_DELAY);
+    	}
+    }
+  }
+}
 
+/* Runs in interrupt context on each PC7 rising edge (IMU data-ready).
+   Does the minimum: wake the control task, then return. */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == IMU_INT1_Pin && defaultTaskHandle != NULL) {
+    osThreadFlagsSet(defaultTaskHandle, IMU_FLAG);   /* safe from an interrupt */
+  }
+}
 /* USER CODE END Application */
 

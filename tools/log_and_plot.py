@@ -11,7 +11,7 @@ import time
 import matplotlib.pyplot as plt
 import serial                                   # from the pyserial package
 
-PORT = "/dev/ttyACM1"                           # ST-LINK's USB serial port
+PORT = sys.argv[2] if len(sys.argv) > 2 else "/dev/ttyACM0"                           # ST-LINK's USB serial port
 BAUD = 115200                                   # must match USART2 in CubeMX
 seconds = float(sys.argv[1]) if len(sys.argv) > 1 else 20.0
 
