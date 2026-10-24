@@ -43,6 +43,17 @@ LSM6DSOX --SPI2 (5.6 MHz, mode 3)--> STM32F446
 
 **IMU rate 3.5 % slow.** Designed for the nominal 1.66 kHz but measured 1.608 kHz. The chip's factory trim register `INTERNAL_FREQ_FINE` read −24 ( -24 * 0.15% = −3.60 %), agreeing with the measurement within one step, so the filter's time step is now derived from that register at boot.
 
+## Software-in-the-loop (SIL) simulation
+
+`sim/roll_sim.py` closes a simulated roll axis around the **firmware's own `core/pid.c`** (compiled as a shared library, called via ctypes), using the measured loop rate (1608 Hz) and sensor noise. Plant parameters (inertia, motor lag, thrust) are **estimates** until real motors and frame are measured, so results validate the controller structure and harness, not final performance.
+
+| Test | Result (estimated plant) |
+|---|---|
+| 10° step, cascaded angle→rate PID | 0 % overshoot, settles to ±1° in 245 ms (REQ-06 limit: ≤ 20 % overshoot) |
+| Constant 20 % torque disturbance, no rate integrator | Stuck 4° off setpoint |
+| Same disturbance, rate integrator ki = 0.1 | Peak 1.7°, recovered within ~0.3 s |
+| D-term low-pass filter (α = 0.95, ≈ 13 Hz cutoff) | Removed D-amplified gyro noise from motor command; settling +11 ms |
+
 ## Build and test
 
 ```bash
@@ -59,6 +70,7 @@ NUCLEO-F446RE · Adafruit LSM6DSOX breakout (SPI2: PB13 SCK, PB14 MISO, PB15 MOS
 - [x] Requirements v0, portable control library + host tests
 - [x] IMU bring-up (I²C, then SPI), bias calibration
 - [x] Interrupt-driven loop, timing verified (REQ-01)
-- [ ] Python plant model + HIL test harness (REQ-02, REQ-06)
+- [x] Python plant model
+- [ ] HIL test harness (REQ-02, REQ-06)
 - [ ] Watchdog and failsafes (REQ-03 to 05)
 - [ ] ESC/motor output (DShot), thrust rig, PID tuning
