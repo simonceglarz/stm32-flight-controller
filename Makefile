@@ -27,3 +27,11 @@ $(BUILD):
 
 clean:
 	rm -rf $(BUILD)
+
+# Shared library for the Python simulator (same C code as the firmware)
+sim/build/libcore.so: core/pid.c sim/pid_shim.c core/pid.h
+	mkdir -p sim/build
+	$(CC) $(CFLAGS) -shared -fPIC core/pid.c sim/pid_shim.c -o $@ $(LDLIBS)
+
+.PHONY: sim
+sim: sim/build/libcore.so
