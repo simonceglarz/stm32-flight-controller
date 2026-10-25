@@ -30,6 +30,7 @@
 #include "imu_convert.h"
 #include "comp_filter.h"
 #include "usart.h"
+#include "roll_ctrl.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,6 +42,7 @@ typedef struct {
 	float gx_dps;	/*raw gyro X, deg/s */
 	float acc_deg;	/*accel-only angle, deg */
 	float angle_deg;/*filtered angle, deg */
+	float cmd;		/* controller output, -1..1 (no motors yet) */
 } telem_t;
 /* USER CODE END PTD */
 
@@ -214,6 +216,9 @@ void StartDefaultTask(void *argument)
 	  uint32_t n = 0;
 	  uint32_t drdy_timeouts = 0;
 
+	  roll_ctrl_t ctrl;
+	  roll_ctrl_init(&ctrl, &ROLL_GAINS_DEFAULT);	/*gains from SIL tuning */
+
 	  for (;;) {
 		/* Sleep until the interrupt says a new sample is ready. The task uses
 		   no CPU while waiting; the IMU's clock sets the loop rate. */
@@ -232,8 +237,14 @@ void StartDefaultTask(void *argument)
       float acc_angle = cf_accel_angle_deg(s.accel_g[1], s.accel_g[2]);
       float angle = cf_update(&roll, s.gyro_dps[0], acc_angle, dt);
 
+      /* Inner loop needs the bias-correcct rate (the filter corrects internally,
+       *  but the raw s.gyro_dps[0] still contains the ~0.5 dps bias */
+      float rate_dps = s.gyro_dps[0] - roll.gyro_bias_dps;
+      /* Hold level, Output drives nothing yet; it is logged so we can check sign and size */
+      float cmd = roll_ctrl_step(&ctrl, 0.0f, angle, rate_dps, dt);
+
       if (++n % TELEM_DIVIDER == 0) {
-        telem_t t = { osKernelGetTickCount(), s.accel_g[2], s.gyro_dps[0], acc_angle, angle };
+        telem_t t = { osKernelGetTickCount(), s.accel_g[2], s.gyro_dps[0], acc_angle, angle, cmd };
         osMessageQueuePut(telemQueue, &t, 0, 0);   /* timeout 0: never wait here */
       }
     }
@@ -256,9 +267,9 @@ static void TelemetryTask(void *argument)
   for (;;) {
     if (osMessageQueueGet(telemQueue, &t, NULL, osWaitForever) == osOK) {
     	char line[64];                                    /* one CSV line, ~40 chars */
-    	int len = snprintf(line, sizeof line, "%lu,%.3f,%.2f,%.2f,%.2f\r\n",
+    	int len = snprintf(line, sizeof line, "%lu,%.3f,%.2f,%.2f,%.2f,%3f\r\n",
     	                   t.tick, (double)t.az_g, (double)t.gx_dps,
-    	                   (double)t.acc_deg, (double)t.angle_deg);
+    	                   (double)t.acc_deg, (double)t.angle_deg, (double)t.cmd);
     	if (len > 0) {
     	  /* No newlib stdout lock held while sending, so the control task
     	     can preempt this at any point. */
