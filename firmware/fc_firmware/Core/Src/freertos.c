@@ -31,6 +31,7 @@
 #include "comp_filter.h"
 #include "usart.h"
 #include "roll_ctrl.h"
+#include "hil_proto.h"   /* HIL message format from core/ */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,6 +53,12 @@ typedef struct {
 #define IMU_ODR_HZ		1608.0f	/*IMU output rate = loop rate (REQ-01) */
 #define TELEM_DIVIDER	166u	/*send 1 of every 166 samples -> 10Hz telemetry*/
 #define DRDY_TIMEOUT_MS	5u		/*no data-ready for 5ms = IMU fault (seed for REQ-02*/
+
+/* 1 = HIL mode: PC sends sensor values, board replies with motor command.
+   0 = normal mode: real IMU drives the loop. Rebuild + reflash after changing. */
+#define HIL_MODE        1
+#define HIL_DT_S        (1.0f / 1608.0f)   /* simulated step, s: matches the real loop rate (622 us) */
+#define HIL_TX_TIMEOUT  10u                /* ms: max wait to send a 13-byte reply (~1.1 ms at 115200) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -62,6 +69,8 @@ typedef struct {
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
 static osMessageQueueId_t telemQueue;	/*mailbox between control and telemetry tasks */
+static osMessageQueueId_t rxQueue;      /* bytes received from the PC, waiting to be parsed */
+static uint8_t rx_byte;                 /* where the UART drops each received byte */
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
@@ -74,6 +83,7 @@ const osThreadAttr_t defaultTask_attributes = {
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 static void TelemetryTask(void *argument);
+static void hil_loop(void);                  /* HIL main loop: never returns */
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -120,6 +130,8 @@ void MX_FREERTOS_Init(void) {
 	/*16 slots; if the telemetry task falls behind, new samples are dropped
 	instead of the control task waiting */
 	telemQueue = osMessageQueueNew(16, sizeof(telem_t), NULL);
+	/* 256 one-byte slots: room for 12 SENSOR frames, far more than lock-step needs */
+	rxQueue = osMessageQueueNew(256, sizeof(uint8_t), NULL);
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -154,7 +166,12 @@ void StartDefaultTask(void *argument)
   /* USER CODE BEGIN StartDefaultTask */
 
 	(void)argument;
-	/*---One-time setup*/
+
+#if HIL_MODE
+  hil_loop();          /* PC drives everything; IMU, filter and telemetry are skipped */
+#endif
+
+    /* ---- Otherwise, Normal mode (unchanged below) ---- */
 	int rc = lsm6dsox_init();		/*bring up the IMU; 0 = success*/
 	printf("IMU init: %d\r\n", rc);	/*report which step failed, if any*/
 	  /* Factory-trimmed oscillator deviation for this specific chip (DS12814, reg 0x63).
@@ -285,6 +302,90 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == IMU_INT1_Pin && defaultTaskHandle != NULL) {
     osThreadFlagsSet(defaultTaskHandle, IMU_FLAG);   /* safe from an interrupt */
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * HIL main loop. Replaces the IMU loop when HIL_MODE is 1.
+ * Each pass: collect bytes until a complete SENSOR message arrives, run the
+ * controller on its values, and send back a CMD message with the same number.
+ * ------------------------------------------------------------------------- */
+static void hil_loop(void)
+{
+  roll_ctrl_t ctrl;                          /* the same controller as in normal mode */
+  roll_ctrl_init(&ctrl, &ROLL_GAINS_DEFAULT);
+
+  hil_parser_t parser;                       /* rebuilds messages from single bytes */
+  hil_parser_init(&parser);
+
+  uint8_t out[HIL_MAX_FRAME];                /* reply bytes are built here */
+
+  /* Ask the UART for the first byte. From then on the callback re-arms itself. */
+  HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+
+  for (;;) {
+    /* 1. Wait (sleeping, no CPU used) until the interrupt has queued a byte */
+    uint8_t b;
+    if (osMessageQueueGet(rxQueue, &b, NULL, osWaitForever) != osOK) {
+      continue;
+    }
+
+    /* 2. Give the byte to the parser. Only act once a whole, undamaged
+          SENSOR message has arrived; every other byte just returns here. */
+    if (hil_parser_feed(&parser, b) != HIL_TYPE_SENSOR) {
+      continue;
+    }
+    hil_sensor_t s;
+    if (hil_decode_sensor(&parser, &s) != 0) {
+      continue;                              /* wrong size: ignore */
+    }
+
+    HAL_GPIO_WritePin(LOOP_PIN_GPIO_Port, LOOP_PIN_Pin, GPIO_PIN_SET);   /* timing: start */
+
+    /* 3. Message #0 = the PC is starting a new run, so clear the controller's memory */
+    if (s.seq == 0) {
+      roll_ctrl_reset(&ctrl);
+    }
+
+    /* 4. Exactly the call the real loop makes, with values from the PC */
+    hil_cmd_t c = {
+      .seq    = s.seq,                       /* echo the number so the PC can match the reply */
+      .cmd    = roll_ctrl_step(&ctrl, s.angle_sp_deg, s.angle_deg, s.rate_dps, HIL_DT_S),
+      .status = HIL_STATUS_OK,
+    };
+
+    /* 5. Package and send the reply */
+    size_t n = hil_encode_cmd(&c, out);
+
+    HAL_GPIO_WritePin(LOOP_PIN_GPIO_Port, LOOP_PIN_Pin, GPIO_PIN_RESET); /* timing: end */
+
+    HAL_UART_Transmit(&huart2, out, (uint16_t)n, HIL_TX_TIMEOUT);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Called by HAL (inside the USART2 interrupt) each time one byte has arrived.
+ * Keep it tiny: store the byte, re-arm, return. The task does the real work.
+ * ------------------------------------------------------------------------- */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart == &huart2) {
+    osMessageQueuePut(rxQueue, &rx_byte, 0, 0);   /* timeout 0: if the queue is ever full, drop
+                                                     the byte rather than wait (interrupts can't
+                                                     wait); the CRC will reject that frame */
+    HAL_UART_Receive_IT(&huart2, &rx_byte, 1);    /* ask for the next byte */
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Called by HAL if the UART reports a receive error (for example "overrun":
+ * a new byte arrived before the previous one was collected). HAL stops
+ * receiving after an error, so restart it, or the board would go deaf.
+ * ------------------------------------------------------------------------- */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart == &huart2) {
+    HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
   }
 }
 /* USER CODE END Application */
